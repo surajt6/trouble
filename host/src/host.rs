@@ -12,9 +12,9 @@ use bt_hci::cmd::controller_baseband::{
 };
 use bt_hci::cmd::info::ReadBdAddr;
 use bt_hci::cmd::le::{
-    LeConnUpdate, LeCreateConnCancel, LeEnableEncryption, LeLongTermKeyRequestReply, LeReadBufferSize,
-    LeReadFilterAcceptListSize, LeSetAdvEnable, LeSetEventMask, LeSetExtAdvEnable, LeSetExtScanEnable, LeSetRandomAddr,
-    LeSetScanEnable,
+    LeAddDeviceToResolvingList, LeConnUpdate, LeCreateConnCancel, LeEnableEncryption, LeLongTermKeyRequestReply,
+    LeReadBufferSize, LeReadFilterAcceptListSize, LeSetAdvEnable, LeSetEventMask, LeSetExtAdvEnable,
+    LeSetExtScanEnable, LeSetRandomAddr, LeSetScanEnable,
 };
 use bt_hci::cmd::link_control::Disconnect;
 use bt_hci::cmd::{AsyncCmd, SyncCmd};
@@ -454,9 +454,6 @@ where
                     info!("[host] agreed att MTU of {}", mtu);
                     let len = w.len();
                     self.connections.try_outbound(acl.handle(), Pdu::new(packet, len))?;
-                } else if let Ok(att::Att::Server(AttServer::Response(att::AttRsp::ExchangeMtu { mtu }))) = a {
-                    info!("[host] remote agreed att MTU of {}", mtu);
-                    self.connections.exchange_att_mtu(acl.handle(), mtu);
                 } else {
                     #[cfg(feature = "gatt")]
                     match a {
@@ -723,6 +720,7 @@ impl<'d, C: Controller, P: PacketPool> Runner<'d, C, P> {
             + ControllerCmdSync<LeReadBufferSize>
             + ControllerCmdSync<LeLongTermKeyRequestReply>
             + ControllerCmdAsync<LeEnableEncryption>
+            + ControllerCmdSync<LeAddDeviceToResolvingList>
             + ControllerCmdSync<ReadBdAddr>,
     {
         let dummy = DummyHandler;
@@ -751,6 +749,7 @@ impl<'d, C: Controller, P: PacketPool> Runner<'d, C, P> {
             + ControllerCmdSync<LeReadBufferSize>
             + ControllerCmdSync<LeLongTermKeyRequestReply>
             + ControllerCmdAsync<LeEnableEncryption>
+            + ControllerCmdSync<LeAddDeviceToResolvingList>
             + ControllerCmdSync<ReadBdAddr>,
     {
         let control_fut = self.control.run();
@@ -1015,7 +1014,9 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                     }
                 }
                 // Ignore
-                Ok(_) => {}
+                Ok(ignored) => {
+                    info!("Ignored event: {:?}", ignored)
+                }
                 Err(e) => {
                     return Err(BleHostError::Controller(e));
                 }
@@ -1047,6 +1048,7 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
             + ControllerCmdSync<LeReadBufferSize>
             + ControllerCmdSync<LeLongTermKeyRequestReply>
             + ControllerCmdAsync<LeEnableEncryption>
+            + ControllerCmdSync<LeAddDeviceToResolvingList>
             + ControllerCmdSync<ReadBdAddr>,
     {
         let host = &self.stack.host;

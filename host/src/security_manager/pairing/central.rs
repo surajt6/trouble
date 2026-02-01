@@ -8,15 +8,23 @@ use rand_core::{CryptoRng, RngCore};
 use crate::codec::{Decode, Encode};
 use crate::connection::{ConnectionEvent, SecurityLevel};
 use crate::security_manager::constants::ENCRYPTION_KEY_SIZE_128_BITS;
-use crate::security_manager::crypto::{Confirm, DHKey, MacKey, Nonce, PublicKey, SecretKey};
+use crate::security_manager::crypto::{
+    c1, s1, Confirm, DHKey, LegacyConfirm, MacKey, Nonce, PublicKey, SecretKey, ShortTermKey, TemporaryKey,
+};
 use crate::security_manager::pairing::util::{
-    choose_pairing_method, make_confirm_packet, make_dhkey_check_packet, make_pairing_random, make_public_key_packet,
-    prepare_packet, CommandAndPayload, PairingMethod, PassKeyEntryAction,
+    choose_legacy_pairing_method, choose_pairing_method, count_keys_to_distribute, is_legacy_pairing,
+    legacy_io_action_for_role, make_central_identification_packet, make_confirm_packet, make_dhkey_check_packet,
+    make_encryption_information_packet, make_identity_address_information_packet, make_identity_information_packet,
+    make_legacy_confirm_packet, make_legacy_random_packet, make_pairing_random, make_public_key_packet,
+    make_signing_information_packet, prepare_packet, CommandAndPayload, LegacyIoAction, LegacyPairingMethod,
+    PairingMethod, PassKeyEntryAction,
 };
 use crate::security_manager::pairing::{Event, PairingOps};
-use crate::security_manager::types::{AuthReq, BondingFlag, Command, PairingFeatures};
+use crate::security_manager::types::{AuthReq, BondingFlag, Command, Ediv, PairingFeatures, Rand};
 use crate::security_manager::{PassKey, Reason};
-use crate::{Address, BondInformation, Error, IoCapabilities, LongTermKey, PacketPool};
+use crate::{
+    AddrKind, Address, BdAddr, BondInformation, Error, IdentityResolvingKey, IoCapabilities, LongTermKey, PacketPool,
+};
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -24,16 +32,24 @@ enum Step {
     Idle,
     WaitingPairingResponse(PairingRequestSentTag),
     WaitingPublicKey,
-    // Numeric comparison
+    // Numeric comparison (LESC)
     WaitingNumericComparisonConfirm,
     WaitingNumericComparisonRandom,
     WaitingNumericComparisonResult,
-    // Pass key entry
+    // Pass key entry (LESC)
     WaitingPassKeyInput,
     WaitingPassKeyEntryConfirm(PassKeyEntryConfirmSentTag),
     WaitingPassKeyEntryRandom(i32),
     // TODO add OOB
     WaitingDHKeyEb(DHKeyEaSentTag),
+    // Legacy pairing states
+    /// Waiting for TK input from user (legacy passkey entry)
+    LegacyWaitingTkInput,
+    /// Waiting for peer's confirm value (legacy)
+    LegacyWaitingConfirm(LegacyConfirmSentTag),
+    /// Waiting for peer's random value (legacy)
+    LegacyWaitingRandom,
+    // Common states
     WaitingLinkEncrypted,
     WaitingBondedLinkEncryption,
     ReceivingKeys(i32),
@@ -128,6 +144,90 @@ impl DHKeyEaSentTag {
     }
 }
 
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+struct LegacyConfirmSentTag {}
+
+impl LegacyConfirmSentTag {
+    fn new<P: PacketPool, OPS: PairingOps<P>, RNG: RngCore>(
+        pairing_data: &mut PairingData,
+        ops: &mut OPS,
+        rng: &mut RNG,
+    ) -> Result<Self, Error> {
+        let legacy = pairing_data.legacy_data.as_mut().ok_or(Error::InvalidValue)?;
+
+        // Generate our random value (Mrand for central/initiator)
+        let mut rand_bytes = [0u8; 16];
+        rng.fill_bytes(&mut rand_bytes);
+        legacy.local_rand = u128::from_le_bytes(rand_bytes);
+        info!("Confirm value Rand bytes: {:?}", legacy.local_rand);
+
+        // Calculate confirm value using c1 function
+        let confirm = c1(
+            &legacy.tk,
+            legacy.local_rand,
+            &legacy.pairing_request,
+            &legacy.pairing_response,
+            pairing_data.local_address,
+            pairing_data.peer_address,
+        );
+        info!("legacy.pairing_request: {:?}", &legacy.pairing_request);
+        info!("legacy.pairing_response: {:?}", &legacy.pairing_response);
+        // info!("Confirm value: {:?}", confirm);
+
+        // Send confirm packet
+        let packet = make_legacy_confirm_packet::<P>(&confirm)?;
+        ops.try_send_packet(packet)?;
+
+        Ok(Self {})
+    }
+}
+
+/// Legacy pairing specific data
+#[derive(Debug, Clone)]
+struct LegacyPairingData {
+    /// Temporary Key (from passkey or zero for Just Works)
+    tk: TemporaryKey,
+    /// Our random value (Mrand for central)
+    local_rand: u128,
+    /// Peer's random value (Srand from peripheral)
+    peer_rand: u128,
+    /// Stored pairing request payload (for c1 calculation)
+    pairing_request: [u8; 7],
+    /// Stored pairing response payload (for c1 calculation)
+    pairing_response: [u8; 7],
+    /// Peer's confirm value
+    peer_confirm: LegacyConfirm,
+    /// Generated STK
+    stk: Option<ShortTermKey>,
+    /// Legacy pairing method
+    method: LegacyPairingMethod,
+    /// LTK to be distributed to peer (generated randomly, different from STK)
+    distributed_ltk: Option<LongTermKey>,
+    /// EDIV for the distributed LTK (generated randomly)
+    distributed_ediv: Option<Ediv>,
+    /// Rand for the distributed LTK (generated randomly)
+    distributed_rand: Option<Rand>,
+}
+
+impl Default for LegacyPairingData {
+    fn default() -> Self {
+        Self {
+            tk: TemporaryKey::just_works(),
+            local_rand: 0,
+            peer_rand: 0,
+            pairing_request: [0; 7],
+            pairing_response: [0x02, 0, 0, 0, 0, 0, 0],
+            peer_confirm: LegacyConfirm(0),
+            stk: None,
+            method: LegacyPairingMethod::JustWorks,
+            distributed_ltk: None,
+            distributed_ediv: None,
+            distributed_rand: None,
+        }
+    }
+}
+
 struct PairingData {
     local_address: Address,
     peer_address: Address,
@@ -147,6 +247,10 @@ struct PairingData {
     ltk: Option<LongTermKey>,
     timeout_at: Instant,
     bond_information: Option<BondInformation>,
+    /// Legacy pairing data (only used for legacy pairing)
+    legacy_data: Option<LegacyPairingData>,
+    /// Whether this is a legacy pairing session
+    is_legacy: bool,
 }
 
 impl PairingData {
@@ -207,6 +311,8 @@ impl Pairing {
             private_key: None,
             timeout_at: Instant::now() + crate::security_manager::constants::TIMEOUT_DISABLE,
             bond_information: None,
+            legacy_data: None,
+            is_legacy: false,
         };
         Self {
             pairing_data: RefCell::new(pairing_data),
@@ -282,8 +388,29 @@ impl Pairing {
             (Step::WaitingLinkEncrypted, Event::LinkEncryptedResult(res)) => {
                 if res {
                     info!("Link encrypted!");
-                    // TODO wait for keys
-                    Step::Success
+                    // Check if peripheral will send keys (responder sends first per BT spec)
+                    let mut pairing_data = self.pairing_data.borrow_mut();
+
+                    // Generate legacy distribution keys if we need to send encryption keys
+                    if pairing_data.is_legacy {
+                        let initiator_keys = pairing_data.local_features.initiator_key_distribution;
+                        if initiator_keys.encryption_key() {
+                            Self::generate_legacy_distribution_keys(pairing_data.deref_mut(), rng)?;
+                        }
+                    }
+
+                    let responder_keys = pairing_data.peer_features.responder_key_distribution;
+                    let is_legacy = pairing_data.is_legacy;
+                    drop(pairing_data);
+
+                    let key_count = count_keys_to_distribute(responder_keys, is_legacy);
+                    if key_count > 0 {
+                        info!("[smp] Waiting to receive {} keys from peripheral", key_count);
+                        Step::ReceivingKeys(key_count)
+                    } else {
+                        // No keys from peripheral, check if we need to send keys
+                        self.transition_to_sending_or_success(ops)?
+                    }
                 } else {
                     error!("Link encryption failed!");
                     Step::Error(Error::Security(Reason::KeyRejected))
@@ -315,6 +442,15 @@ impl Pairing {
                     rng,
                 )?)
             }
+            // Legacy pairing: TK input for passkey entry
+            (Step::LegacyWaitingTkInput, Event::PassKeyInput(input)) => {
+                let mut pairing_data = self.pairing_data.borrow_mut();
+                if let Some(legacy) = pairing_data.legacy_data.as_mut() {
+                    legacy.tk = TemporaryKey::from_passkey(input);
+                }
+                // Now send our confirm value
+                Step::LegacyWaitingConfirm(LegacyConfirmSentTag::new(pairing_data.deref_mut(), ops, rng)?)
+            }
             (x, Event::PassKeyConfirm | Event::PassKeyCancel) => x,
             _ => Step::Error(Error::InvalidState),
         };
@@ -331,6 +467,20 @@ impl Pairing {
                 if is_success {
                     let pairing_data = self.pairing_data.borrow();
                     if let Some(bond) = pairing_data.bond_information.as_ref() {
+                        // If we received peer's IRK, add device to controller's resolving list
+                        if let Some(peer_irk) = bond.identity.irk {
+                            let local_irk = ops.get_local_irk().unwrap_or_else(|| IdentityResolvingKey::new(0));
+
+                            if let Err(e) = ops.try_add_device_to_resolving_list(
+                                pairing_data.peer_address.kind,
+                                pairing_data.peer_address.addr,
+                                peer_irk.0.to_le_bytes(),
+                                local_irk.0.to_le_bytes(),
+                            ) {
+                                warn!("[smp] Failed to add device to resolving list: {:?}", e);
+                            }
+                        }
+
                         let pairing_bond = if pairing_data.want_bonding() {
                             Some(bond.clone())
                         } else {
@@ -346,6 +496,26 @@ impl Pairing {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// Transition to sending keys or success after receiving keys (or if no keys to receive).
+    fn transition_to_sending_or_success<P: PacketPool, OPS: PairingOps<P>>(
+        &self,
+        ops: &mut OPS,
+    ) -> Result<Step, Error> {
+        let mut pairing_data = self.pairing_data.borrow_mut();
+        let initiator_keys = pairing_data.local_features.initiator_key_distribution;
+        let is_legacy = pairing_data.is_legacy;
+        let key_count = count_keys_to_distribute(initiator_keys, is_legacy);
+
+        if key_count > 0 {
+            info!("[smp] Starting to send {} keys to peripheral", key_count);
+            // Send all keys at once
+            Self::send_next_key::<P, OPS>(&mut pairing_data, ops)
+        } else {
+            info!("[smp] No keys to send, pairing complete");
+            Ok(Step::Success)
         }
     }
 
@@ -375,10 +545,18 @@ impl Pairing {
                     Step::WaitingPairingResponse(x)
                 }
                 (Step::WaitingPairingResponse(_), Command::PairingResponse) => {
-                    Self::handle_pairing_response(command.payload, ops, pairing_data)?;
-                    Self::generate_private_public_key_pair(pairing_data, rng)?;
-                    Self::send_public_key(ops, pairing_data.local_public_key.as_ref().unwrap())?;
-                    Step::WaitingPublicKey
+                    trace!("pairing response payload {:?}", command.payload);
+                    let is_legacy = Self::handle_pairing_response(command.payload, ops, pairing_data)?;
+
+                    if is_legacy {
+                        // Legacy pairing path
+                        Self::start_legacy_pairing(pairing_data, ops, rng)?
+                    } else {
+                        // LESC pairing path
+                        Self::generate_private_public_key_pair(pairing_data, rng)?;
+                        Self::send_public_key(ops, pairing_data.local_public_key.as_ref().unwrap())?;
+                        Step::WaitingPublicKey
+                    }
                 }
                 (Step::WaitingPublicKey, Command::PairingPublicKey) => {
                     Self::handle_public_key(command.payload, pairing_data)?;
@@ -437,6 +615,39 @@ impl Pairing {
                     Self::handle_dhkey_eb(command.payload, ops, pairing_data)?;
                     Step::WaitingLinkEncrypted
                 }
+                // Legacy pairing states
+                (Step::LegacyWaitingConfirm(_), Command::PairingConfirm) => {
+                    Self::handle_legacy_confirm(command.payload, pairing_data)?;
+                    // Send our random value
+                    Self::send_legacy_random(ops, pairing_data)?;
+                    Step::LegacyWaitingRandom
+                }
+                (Step::LegacyWaitingRandom, Command::PairingRandom) => {
+                    Self::handle_legacy_random(command.payload, ops, pairing_data)?
+                }
+
+                // Key distribution - receiving keys from peripheral
+                (Step::ReceivingKeys(remaining), Command::EncryptionInformation) => {
+                    Self::handle_encryption_information(command.payload, pairing_data)?;
+                    Self::decrement_receiving_keys_or_transition(remaining, pairing_data, ops)?
+                }
+                (Step::ReceivingKeys(remaining), Command::CentralIdentification) => {
+                    Self::handle_central_identification(command.payload, pairing_data)?;
+                    Self::decrement_receiving_keys_or_transition(remaining, pairing_data, ops)?
+                }
+                (Step::ReceivingKeys(remaining), Command::IdentityInformation) => {
+                    Self::handle_identity_information(command.payload, pairing_data)?;
+                    Self::decrement_receiving_keys_or_transition(remaining, pairing_data, ops)?
+                }
+                (Step::ReceivingKeys(remaining), Command::IdentityAddressInformation) => {
+                    Self::handle_identity_address_information(command.payload, pairing_data)?;
+                    Self::decrement_receiving_keys_or_transition(remaining, pairing_data, ops)?
+                }
+                (Step::ReceivingKeys(remaining), Command::SigningInformation) => {
+                    Self::handle_signing_information(command.payload, pairing_data)?;
+                    Self::decrement_receiving_keys_or_transition(remaining, pairing_data, ops)?
+                }
+
                 (x, Command::KeypressNotification) => x,
 
                 _ => return Err(Error::InvalidState),
@@ -452,20 +663,53 @@ impl Pairing {
         payload: &[u8],
         ops: &mut OPS,
         pairing_data: &mut PairingData,
-    ) -> Result<(), Error> {
+    ) -> Result<bool, Error> {
         let peer_features = PairingFeatures::decode(payload).map_err(|_| Error::Security(Reason::InvalidParameters))?;
         if peer_features.maximum_encryption_key_size < ENCRYPTION_KEY_SIZE_128_BITS {
             return Err(Error::Security(Reason::EncryptionKeySize));
         }
-        if !peer_features.security_properties.secure_connection() {
-            return Err(Error::Security(Reason::UnspecifiedReason));
-        }
 
         pairing_data.peer_features = peer_features;
-        pairing_data.pairing_method = choose_pairing_method(pairing_data.local_features, pairing_data.peer_features);
-        info!("[smp] Pairing method {:?}", pairing_data.pairing_method);
+        // Check if this should be legacy pairing
+        let is_legacy = is_legacy_pairing(&pairing_data.local_features, &peer_features);
+        pairing_data.is_legacy = is_legacy;
 
-        Ok(())
+        if is_legacy {
+            info!("[smp] Using legacy pairing (peer does not support Secure Connections)");
+
+            // Initialize legacy pairing data
+            let mut legacy = LegacyPairingData::default();
+
+            // Store pairing request/response for c1 calculation
+            // Pairing request was already sent, we need to reconstruct it
+            let mut preq = [0u8; 7];
+            preq[0] = 1 as u8;
+            preq[1] = pairing_data.local_features.io_capabilities as u8;
+            preq[2] = pairing_data.local_features.use_oob as u8;
+            preq[3] = u8::from(pairing_data.local_features.security_properties);
+            preq[4] = pairing_data.local_features.maximum_encryption_key_size;
+            preq[5] = u8::from(pairing_data.local_features.initiator_key_distribution);
+            preq[6] = u8::from(pairing_data.local_features.responder_key_distribution);
+            legacy.pairing_request = preq;
+
+            let copy_len = payload.len();
+            legacy.pairing_response[1..copy_len + 1].copy_from_slice(&payload[..copy_len]);
+
+            // Determine legacy pairing method
+            legacy.method = choose_legacy_pairing_method(&pairing_data.local_features, &peer_features);
+            info!("[smp] Legacy pairing method: {:?}", legacy.method);
+
+            pairing_data.legacy_data = Some(legacy);
+
+            Ok(true) // Return true for legacy pairing
+        } else {
+            // LESC pairing
+            pairing_data.pairing_method =
+                choose_pairing_method(pairing_data.local_features, pairing_data.peer_features);
+            info!("[smp] LESC pairing method: {:?}", pairing_data.pairing_method);
+
+            Ok(false) // Return false for LESC pairing
+        }
     }
 
     fn generate_private_public_key_pair<RNG: CryptoRng + RngCore>(
@@ -626,6 +870,402 @@ impl Pairing {
             return Err(Error::Security(Reason::NumericComparisonFailed));
         }
         pairing_data.peer_nonce = peer_nonce;
+        Ok(())
+    }
+
+    // ========================================================================
+    // Legacy Pairing Helper Functions
+    // ========================================================================
+
+    /// Generate LTK, EDIV, and Rand for legacy pairing key distribution.
+    /// These are different from the STK used to encrypt the link during pairing.
+    fn generate_legacy_distribution_keys<RNG: RngCore>(
+        pairing_data: &mut PairingData,
+        rng: &mut RNG,
+    ) -> Result<(), Error> {
+        if let Some(ref mut legacy) = pairing_data.legacy_data {
+            // Generate random LTK (16 bytes)
+            let mut ltk_bytes = [0u8; 16];
+            rng.fill_bytes(&mut ltk_bytes);
+            legacy.distributed_ltk = Some(LongTermKey::new(u128::from_le_bytes(ltk_bytes)));
+
+            // Generate random EDIV (2 bytes)
+            let ediv = rng.next_u32() as u16;
+            legacy.distributed_ediv = Some(Ediv::new(ediv));
+
+            // Generate random Rand (8 bytes)
+            let rand = rng.next_u64();
+            legacy.distributed_rand = Some(Rand::new(rand));
+
+            info!("[smp] Generated legacy distribution keys: EDIV={}, Rand={}", ediv, rand);
+        }
+        Ok(())
+    }
+
+    /// Start legacy pairing after receiving pairing response
+    fn start_legacy_pairing<P: PacketPool, OPS: PairingOps<P>, RNG: RngCore>(
+        pairing_data: &mut PairingData,
+        ops: &mut OPS,
+        rng: &mut RNG,
+    ) -> Result<Step, Error> {
+        let legacy = pairing_data.legacy_data.as_ref().ok_or(Error::InvalidValue)?;
+        let method = legacy.method;
+        let our_action = legacy_io_action_for_role(&method, true); // true = central
+
+        match method {
+            LegacyPairingMethod::JustWorks => {
+                info!("[smp] Legacy Just Works pairing");
+                // TK = 0 (already set by default)
+                // Send our confirm value
+                Ok(Step::LegacyWaitingConfirm(LegacyConfirmSentTag::new(
+                    pairing_data,
+                    ops,
+                    rng,
+                )?))
+            }
+            LegacyPairingMethod::PasskeyEntry { central, peripheral } => {
+                info!("[smp] Legacy Passkey Entry pairing");
+                match our_action {
+                    LegacyIoAction::Display => {
+                        // Generate and display passkey
+                        let passkey: u32 = rng.gen_range(0..1_000_000);
+                        if let Some(legacy) = pairing_data.legacy_data.as_mut() {
+                            legacy.tk = TemporaryKey::from_passkey(passkey);
+                        }
+                        ops.try_send_connection_event(ConnectionEvent::PassKeyDisplay(PassKey(passkey)))?;
+                        // Send our confirm value
+                        Ok(Step::LegacyWaitingConfirm(LegacyConfirmSentTag::new(
+                            pairing_data,
+                            ops,
+                            rng,
+                        )?))
+                    }
+                    LegacyIoAction::Input => {
+                        // Wait for user to input passkey
+                        ops.try_send_connection_event(ConnectionEvent::PassKeyInput)?;
+                        Ok(Step::LegacyWaitingTkInput)
+                    }
+                    LegacyIoAction::None => {
+                        // Should not happen for PasskeyEntry
+                        error!("[smp] Invalid IO action for PasskeyEntry");
+                        Err(Error::InvalidValue)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle peer's legacy confirm value
+    fn handle_legacy_confirm(payload: &[u8], pairing_data: &mut PairingData) -> Result<(), Error> {
+        let legacy = pairing_data.legacy_data.as_mut().ok_or(Error::InvalidValue)?;
+
+        // Store peer's confirm value
+        let confirm_bytes: [u8; 16] = payload
+            .try_into()
+            .map_err(|_| Error::Security(Reason::InvalidParameters))?;
+        legacy.peer_confirm = LegacyConfirm::from_le_bytes(confirm_bytes);
+
+        info!("[smp] Received legacy confirm from peer");
+        Ok(())
+    }
+
+    /// Send our random value for legacy pairing
+    fn send_legacy_random<P: PacketPool, OPS: PairingOps<P>>(
+        ops: &mut OPS,
+        pairing_data: &PairingData,
+    ) -> Result<(), Error> {
+        let legacy = pairing_data.legacy_data.as_ref().ok_or(Error::InvalidValue)?;
+
+        let packet = make_legacy_random_packet::<P>(legacy.local_rand)?;
+        info!("Random value sent: {:?}", legacy.local_rand);
+        ops.try_send_packet(packet)?;
+
+        info!("[smp] Sent legacy random (Mrand)");
+        Ok(())
+    }
+
+    /// Handle peer's `random` value and verify confirm, then generate STK
+    fn handle_legacy_random<P: PacketPool, OPS: PairingOps<P>>(
+        payload: &[u8],
+        ops: &mut OPS,
+        pairing_data: &mut PairingData,
+    ) -> Result<Step, Error> {
+        let legacy = pairing_data.legacy_data.as_mut().ok_or(Error::InvalidValue)?;
+
+        // Extract peer's random value (Srand)
+        let rand_bytes: [u8; 16] = payload
+            .try_into()
+            .map_err(|_| Error::Security(Reason::InvalidParameters))?;
+        legacy.peer_rand = u128::from_le_bytes(rand_bytes);
+
+        info!("[smp] Received legacy random (Srand) from peer");
+
+        // Verify peer's confirm value by recalculating c1 with their random
+        let expected_confirm = c1(
+            &legacy.tk,
+            legacy.peer_rand,
+            &legacy.pairing_request,
+            &legacy.pairing_response,
+            pairing_data.local_address,
+            pairing_data.peer_address,
+        );
+
+        if expected_confirm != legacy.peer_confirm {
+            error!("[smp] Legacy confirm value mismatch!");
+            return Err(Error::Security(Reason::ConfirmValueFailed));
+        }
+
+        info!("[smp] Legacy confirm value verified");
+
+        // Generate STK using s1 function
+        // s1(TK, Srand, Mrand) - note: Srand is peer's rand, Mrand is our rand
+        let stk = s1(&legacy.tk, legacy.peer_rand, legacy.local_rand);
+        legacy.stk = Some(stk);
+
+        info!("[smp] Generated STK");
+
+        // As central/initiator, start encryption with the STK
+        // For STK: ediv = 0, rand = 0
+        let ltk = LongTermKey::new(stk.0);
+        let security_level = legacy.method.security_level();
+        let want_bonding = pairing_data.want_bonding();
+
+        let bond = ops.try_enable_encryption(&ltk, security_level, want_bonding)?;
+        pairing_data.bond_information = Some(bond);
+
+        info!("Move to next step - waiting for link to be encrypted");
+        Ok(Step::WaitingLinkEncrypted)
+    }
+
+    // ========================================================================
+    // Key Reception Handlers (receiving keys from peripheral)
+    // ========================================================================
+
+    fn handle_encryption_information(payload: &[u8], pairing_data: &mut PairingData) -> Result<(), Error> {
+        let ltk_bytes: [u8; 16] = payload.try_into().map_err(|_| Error::InvalidValue)?;
+        let ltk = LongTermKey::new(u128::from_le_bytes(ltk_bytes));
+
+        info!("[smp] Received EncryptionInformation (LTK) from peripheral");
+        if let Some(ref mut bond) = pairing_data.bond_information {
+            bond.peer_ltk = Some(ltk);
+        }
+        Ok(())
+    }
+
+    fn handle_central_identification(payload: &[u8], pairing_data: &mut PairingData) -> Result<(), Error> {
+        let ediv = Ediv::from_le_bytes([payload[0], payload[1]]);
+        let rand_bytes: [u8; 8] = payload[2..10].try_into().map_err(|_| Error::InvalidValue)?;
+        let rand = Rand::from_le_bytes(rand_bytes);
+
+        info!(
+            "[smp] Received CentralIdentification (EDIV={}, Rand) from peripheral",
+            ediv.0
+        );
+        if let Some(ref mut bond) = pairing_data.bond_information {
+            bond.peer_ediv = Some(ediv);
+            bond.peer_rand = Some(rand);
+        }
+        Ok(())
+    }
+
+    fn handle_identity_information(payload: &[u8], pairing_data: &mut PairingData) -> Result<(), Error> {
+        let irk_bytes: [u8; 16] = payload.try_into().map_err(|_| Error::InvalidValue)?;
+        let irk = IdentityResolvingKey::new(u128::from_le_bytes(irk_bytes));
+
+        info!("[smp] Received IdentityInformation (IRK) from peripheral");
+        if let Some(ref mut bond) = pairing_data.bond_information {
+            bond.identity.irk = Some(irk);
+        }
+        Ok(())
+    }
+
+    fn handle_identity_address_information(payload: &[u8], pairing_data: &mut PairingData) -> Result<(), Error> {
+        let addr_type = payload[0];
+        let kind = if addr_type == 0 {
+            AddrKind::PUBLIC
+        } else if addr_type == 1 {
+            AddrKind::RANDOM
+        } else {
+            return Err(Error::InvalidValue);
+        };
+        let addr = BdAddr::new(payload[1..7].try_into().map_err(|_| Error::InvalidValue)?);
+
+        info!(
+            "[smp] Received IdentityAddressInformation: type={}, addr={:?}",
+            addr_type, addr
+        );
+
+        // Update peer address to identity address
+        pairing_data.peer_address = Address { kind, addr };
+        if let Some(ref mut bond) = pairing_data.bond_information {
+            bond.identity.bd_addr = addr;
+        }
+        Ok(())
+    }
+
+    fn handle_signing_information(payload: &[u8], pairing_data: &mut PairingData) -> Result<(), Error> {
+        let csrk_bytes: [u8; 16] = payload.try_into().map_err(|_| Error::InvalidValue)?;
+        let csrk = u128::from_le_bytes(csrk_bytes);
+
+        info!("[smp] Received SigningInformation (CSRK) from peripheral");
+        if let Some(ref mut bond) = pairing_data.bond_information {
+            bond.peer_csrk = Some(csrk);
+        }
+        Ok(())
+    }
+
+    /// Helper to decrement remaining keys count and transition to next state.
+    fn decrement_receiving_keys_or_transition<P: PacketPool, OPS: PairingOps<P>>(
+        remaining: i32,
+        pairing_data: &mut PairingData,
+        ops: &mut OPS,
+    ) -> Result<Step, Error> {
+        let new_remaining = remaining - 1;
+        if new_remaining > 0 {
+            Ok(Step::ReceivingKeys(new_remaining))
+        } else {
+            // All keys received from peripheral, now check if we need to send keys
+            let initiator_keys = pairing_data.local_features.initiator_key_distribution;
+            let is_legacy = pairing_data.is_legacy;
+            let key_count = count_keys_to_distribute(initiator_keys, is_legacy);
+
+            if key_count > 0 {
+                info!("[smp] Starting to send {} keys to peripheral", key_count);
+                Self::send_next_key::<P, OPS>(pairing_data, ops)
+            } else {
+                info!("[smp] No keys to send, pairing complete");
+                Ok(Step::Success)
+            }
+        }
+    }
+
+    // ========================================================================
+    // Key Distribution Functions (sending keys to peripheral)
+    // ========================================================================
+
+    /// Send all keys to the peripheral in the correct order.
+    /// In SMP, keys are sent consecutively without waiting for acknowledgments.
+    /// Returns Step::Success when all keys have been sent.
+    fn send_next_key<P: PacketPool, OPS: PairingOps<P>>(
+        pairing_data: &mut PairingData,
+        ops: &mut OPS,
+    ) -> Result<Step, Error> {
+        let flags = pairing_data.local_features.initiator_key_distribution;
+        let is_legacy = pairing_data.is_legacy;
+
+        // Keys must be sent in order: EncryptionKey (LTK+EDIV/Rand), IdentityKey (IRK+Addr), SigningKey (CSRK)
+
+        // For legacy pairing: EncryptionInformation + CentralIdentification
+        if is_legacy && flags.encryption_key() {
+            Self::send_encryption_information::<P, OPS>(pairing_data, ops)?;
+            Self::send_central_identification::<P, OPS>(pairing_data, ops)?;
+        }
+
+        // IdentityInformation + IdentityAddressInformation
+        if flags.identity_key() {
+            Self::send_identity_information::<P, OPS>(pairing_data, ops)?;
+            Self::send_identity_address_information::<P, OPS>(pairing_data, ops)?;
+        }
+
+        // SigningInformation
+        if flags.signing_key() {
+            Self::send_signing_information::<P, OPS>(pairing_data, ops)?;
+        }
+
+        // All keys sent
+        Ok(Step::Success)
+    }
+
+    fn send_encryption_information<P: PacketPool, OPS: PairingOps<P>>(
+        pairing_data: &mut PairingData,
+        ops: &mut OPS,
+    ) -> Result<(), Error> {
+        let ltk = if pairing_data.is_legacy {
+            // For legacy pairing, use the distributed LTK (not the STK)
+            pairing_data
+                .legacy_data
+                .as_ref()
+                .and_then(|l| l.distributed_ltk)
+                .ok_or_else(|| {
+                    error!("[smp] No distributed LTK for legacy pairing");
+                    Error::InvalidValue
+                })?
+        } else {
+            // For LESC, use pairing_data.ltk
+            pairing_data.ltk.ok_or_else(|| {
+                error!("[smp] No LTK found");
+                Error::InvalidValue
+            })?
+        };
+
+        let packet = make_encryption_information_packet::<P>(&ltk)?;
+        ops.try_send_packet(packet)?;
+
+        // Update bond information with the distributed LTK
+        if let Some(ref mut bond) = pairing_data.bond_information {
+            bond.ltk = ltk;
+        }
+
+        info!("[smp] Sent EncryptionInformation (LTK)");
+        Ok(())
+    }
+
+    fn send_central_identification<P: PacketPool, OPS: PairingOps<P>>(
+        pairing_data: &PairingData,
+        ops: &mut OPS,
+    ) -> Result<(), Error> {
+        let (ediv, rand) = if pairing_data.is_legacy {
+            // For legacy pairing, use generated EDIV/Rand
+            let legacy = pairing_data.legacy_data.as_ref();
+            (
+                legacy.and_then(|l| l.distributed_ediv).unwrap_or(Ediv::new(0)),
+                legacy.and_then(|l| l.distributed_rand).unwrap_or(Rand::new(0)),
+            )
+        } else {
+            // For LESC, EDIV=0 and Rand=0
+            (Ediv::new(0), Rand::new(0))
+        };
+
+        let packet = make_central_identification_packet::<P>(ediv, rand)?;
+        ops.try_send_packet(packet)?;
+        info!("[smp] Sent CentralIdentification (EDIV={}, Rand={})", ediv.0, rand.0);
+        Ok(())
+    }
+
+    fn send_identity_information<P: PacketPool, OPS: PairingOps<P>>(
+        pairing_data: &PairingData,
+        ops: &mut OPS,
+    ) -> Result<(), Error> {
+        // Send our IRK - get from ops if available, otherwise use a placeholder
+        // TODO: Get local IRK from PairingOps or generate one
+        let local_irk = ops.get_local_irk().unwrap_or_else(|| IdentityResolvingKey::new(0));
+
+        let packet = make_identity_information_packet::<P>(&local_irk)?;
+        ops.try_send_packet(packet)?;
+        info!("[smp] Sent IdentityInformation (IRK)");
+        Ok(())
+    }
+
+    fn send_identity_address_information<P: PacketPool, OPS: PairingOps<P>>(
+        pairing_data: &PairingData,
+        ops: &mut OPS,
+    ) -> Result<(), Error> {
+        let packet = make_identity_address_information_packet::<P>(&pairing_data.local_address)?;
+        ops.try_send_packet(packet)?;
+        info!("[smp] Sent IdentityAddressInformation");
+        Ok(())
+    }
+
+    fn send_signing_information<P: PacketPool, OPS: PairingOps<P>>(
+        _pairing_data: &PairingData,
+        ops: &mut OPS,
+    ) -> Result<(), Error> {
+        // TODO: Generate or use stored CSRK
+        let csrk: u128 = 0; // Placeholder
+
+        let packet = make_signing_information_packet::<P>(csrk)?;
+        ops.try_send_packet(packet)?;
+        info!("[smp] Sent SigningInformation (CSRK)");
         Ok(())
     }
 }

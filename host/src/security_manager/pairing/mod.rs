@@ -5,7 +5,7 @@ use rand_core::{CryptoRng, RngCore};
 use crate::connection::{ConnectionEvent, SecurityLevel};
 use crate::security_manager::types::{BondingFlag, Command};
 use crate::security_manager::TxPacket;
-use crate::{Address, BondInformation, Error, IoCapabilities, LongTermKey, PacketPool};
+use crate::{Address, BondInformation, Error, IdentityResolvingKey, IoCapabilities, LongTermKey, PacketPool};
 
 pub mod central;
 pub mod peripheral;
@@ -25,6 +25,18 @@ pub trait PairingOps<P: PacketPool> {
     fn connection_handle(&mut self) -> ConnHandle;
     fn try_send_connection_event(&mut self, event: ConnectionEvent) -> Result<(), Error>;
     fn bonding_flag(&self) -> BondingFlag;
+    /// Get the local Identity Resolving Key for key distribution.
+    /// Returns None if no local IRK is configured.
+    fn get_local_irk(&self) -> Option<IdentityResolvingKey>;
+    /// Add device to controller's resolving list for RPA resolution.
+    /// Called after pairing completes with IRK exchange.
+    fn try_add_device_to_resolving_list(
+        &self,
+        peer_addr_kind: crate::AddrKind,
+        peer_addr: crate::BdAddr,
+        peer_irk: [u8; 16],
+        local_irk: [u8; 16],
+    ) -> Result<(), Error>;
 }
 
 pub enum Pairing {
@@ -208,6 +220,10 @@ mod tests {
                 identity: Identity::default(),
                 ltk: ltk.clone(),
                 is_bonded,
+                peer_ltk: None,
+                peer_ediv: None,
+                peer_rand: None,
+                peer_csrk: None,
             })
         }
 
@@ -239,6 +255,21 @@ mod tests {
             } else {
                 BondingFlag::NoBonding
             }
+        }
+
+        fn get_local_irk(&self) -> Option<IdentityResolvingKey> {
+            // For tests, return None (no local IRK configured)
+            None
+        }
+
+        fn try_add_device_to_resolving_list(
+            &self,
+            peer_addr_kind: crate::AddrKind,
+            peer_addr: crate::BdAddr,
+            peer_irk: [u8; 16],
+            local_irk: [u8; 16],
+        ) -> Result<(), Error> {
+            Ok(())
         }
     }
 
@@ -691,6 +722,10 @@ mod tests {
                 irk: None,
                 bd_addr: peripheral.addr,
             },
+            peer_ltk: None,
+            peer_ediv: None,
+            peer_rand: None,
+            peer_csrk: None,
         });
 
         peripheral_ops.bond_information = Some(BondInformation {
@@ -701,6 +736,10 @@ mod tests {
                 irk: None,
                 bd_addr: central.addr,
             },
+            peer_ltk: None,
+            peer_ediv: None,
+            peer_rand: None,
+            peer_csrk: None,
         });
 
         let mut rng: ChaCha12Rng = ChaCha12Core::seed_from_u64(1).into();
@@ -758,6 +797,10 @@ mod tests {
                 irk: None,
                 bd_addr: peripheral.addr,
             },
+            peer_ltk: None,
+            peer_ediv: None,
+            peer_rand: None,
+            peer_csrk: None,
         });
 
         peripheral_ops.bond_information = Some(BondInformation {
@@ -768,6 +811,10 @@ mod tests {
                 irk: None,
                 bd_addr: central.addr,
             },
+            peer_ltk: None,
+            peer_ediv: None,
+            peer_rand: None,
+            peer_csrk: None,
         });
 
         let mut rng: ChaCha12Rng = ChaCha12Core::seed_from_u64(1).into();

@@ -418,10 +418,30 @@ const AUTH_REQ_KEY_PRESS: u8 = 0b0001_0000;
 const AUTH_REQ_CT2: u8 = 0b0010_0000;
 
 impl AuthReq {
-    /// Build a AuthReq octet
+    /// Build a AuthReq octet with MITM and Secure Connections flags set
     pub fn new(bonding: BondingFlag) -> Self {
         AuthReq((bonding as u8) | AUTH_REQ_MITM | AUTH_REQ_SECURE_CONNECTION)
     }
+    /// Build a AuthReq octet for legacy pairing (without Secure Connections flag)
+    pub fn new_legacy(bonding: BondingFlag, mitm: bool) -> Self {
+        let mut value = bonding as u8;
+        if mitm {
+            value |= AUTH_REQ_MITM;
+        }
+        // Note: SC bit is NOT set for legacy pairing
+        AuthReq(value)
+    }
+
+    /// Returns a new AuthReq with the Secure Connections bit cleared
+    pub fn without_secure_connections(self) -> Self {
+        AuthReq(self.0 & !AUTH_REQ_SECURE_CONNECTION)
+    }
+
+    /// Returns a new AuthReq with the Secure Connections bit set
+    pub fn with_secure_connections(self) -> Self {
+        AuthReq(self.0 | AUTH_REQ_SECURE_CONNECTION)
+    }
+
     /// Bond requested
     pub fn bond(&self) -> BondingFlag {
         if let Ok(v) = BondingFlag::try_from(self.0) {
@@ -604,13 +624,18 @@ impl PairingFeatures {
 
 impl Default for PairingFeatures {
     fn default() -> Self {
+        let mut ikd = KeyDistributionFlags(0);
+        ikd.set_encryption_key();
+        let mut rkd = KeyDistributionFlags(0);
+        rkd.set_encryption_key();
+        rkd.set_identity_key();
         Self {
             io_capabilities: IoCapabilities::NoInputNoOutput,
             use_oob: UseOutOfBand::NotPresent,
             security_properties: AuthReq::new(BondingFlag::NoBonding),
             maximum_encryption_key_size: ENCRYPTION_KEY_SIZE_128_BITS,
-            initiator_key_distribution: KeyDistributionFlags(0),
-            responder_key_distribution: KeyDistributionFlags(0),
+            initiator_key_distribution: ikd,
+            responder_key_distribution: rkd,
         }
     }
 }
@@ -739,6 +764,90 @@ pub enum SecurityLevel {
     Mode2(SecurityMode2Level),
     /// LE security mode 1
     Mode3(SecurityMode3Level),
+}
+
+// ============================================================================
+// Legacy Pairing Types
+// ============================================================================
+
+/// Encrypted Diversifier (EDIV) for Legacy Pairing.
+///
+/// Used together with Rand to identify the LTK during legacy pairing.
+/// For STK encryption during pairing, EDIV is always 0.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[repr(transparent)]
+pub struct Ediv(pub u16);
+
+impl Ediv {
+    /// Creates an EDIV from a u16 value.
+    #[inline(always)]
+    pub const fn new(value: u16) -> Self {
+        Self(value)
+    }
+
+    /// Returns the EDIV as little-endian bytes.
+    #[inline(always)]
+    pub const fn to_le_bytes(self) -> [u8; 2] {
+        self.0.to_le_bytes()
+    }
+
+    /// Creates an EDIV from little-endian bytes.
+    #[inline(always)]
+    pub const fn from_le_bytes(bytes: [u8; 2]) -> Self {
+        Self(u16::from_le_bytes(bytes))
+    }
+}
+
+/// Random Number (Rand) for Legacy Pairing LTK identification.
+///
+/// Used together with EDIV to identify the LTK during legacy pairing.
+/// For STK encryption during pairing, Rand is always 0.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[repr(transparent)]
+pub struct Rand(pub u64);
+
+impl Rand {
+    /// Creates a Rand from a u64 value.
+    #[inline(always)]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the Rand as little-endian bytes.
+    #[inline(always)]
+    pub const fn to_le_bytes(self) -> [u8; 8] {
+        self.0.to_le_bytes()
+    }
+
+    /// Creates a Rand from little-endian bytes.
+    #[inline(always)]
+    pub const fn from_le_bytes(bytes: [u8; 8]) -> Self {
+        Self(u64::from_le_bytes(bytes))
+    }
+}
+
+/// Legacy Long Term Key with identification values.
+///
+/// In legacy pairing, the LTK is distributed along with EDIV and Rand
+/// which are used to identify the key during reconnection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct LegacyLongTermKey {
+    /// The Long Term Key (128 bits)
+    pub ltk: crate::security_manager::crypto::LongTermKey,
+    /// Encrypted Diversifier
+    pub ediv: Ediv,
+    /// Random Number
+    pub rand: Rand,
+}
+
+impl LegacyLongTermKey {
+    /// Creates a new legacy LTK with the given values.
+    pub const fn new(ltk: crate::security_manager::crypto::LongTermKey, ediv: Ediv, rand: Rand) -> Self {
+        Self { ltk, ediv, rand }
+    }
 }
 
 #[cfg(test)]

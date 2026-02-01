@@ -22,7 +22,7 @@ use heapless::Vec;
 use rand_chacha::ChaCha12Rng;
 use rand_core::SeedableRng;
 use types::Command;
-pub use types::{PassKey, Reason};
+pub use types::{Ediv, PassKey, Rand, Reason};
 
 use crate::connection::SecurityLevel;
 use crate::connection_manager::{ConnectionManager, ConnectionStorage};
@@ -36,9 +36,27 @@ use crate::{Address, Error, Identity, IoCapabilities, PacketPool};
 /// Events of interest to the security manager
 pub(crate) enum SecurityEventData {
     /// A long term key request has been issued
-    SendLongTermKey(ConnHandle),
+    SendLongTermKey {
+        /// Connection handle
+        handle: ConnHandle,
+        /// Encrypted Diversifier (for legacy pairing LTK identification)
+        ediv: Ediv,
+        /// Random number (for legacy pairing LTK identification)
+        rand: Rand,
+    },
     /// Enable encryption on channel
     EnableEncryption(ConnHandle, BondInformation),
+    /// Add device to controller's resolving list after pairing with IRK exchange
+    AddDeviceToResolvingList {
+        /// Peer's identity address type
+        peer_addr_kind: crate::AddrKind,
+        /// Peer's identity address
+        peer_addr: crate::BdAddr,
+        /// Peer's Identity Resolving Key (16 bytes)
+        peer_irk: [u8; 16],
+        /// Local Identity Resolving Key (16 bytes)
+        local_irk: [u8; 16],
+    },
     /// Pairing timeout
     Timeout,
     /// Pairing timer changed
@@ -56,6 +74,15 @@ pub struct BondInformation {
     pub is_bonded: bool,
     /// Security level of this long term key.
     pub security_level: SecurityLevel,
+    // Keys received from peer during key distribution
+    /// Peer's LTK (from EncryptionInformation) - for legacy pairing re-encryption
+    pub peer_ltk: Option<LongTermKey>,
+    /// EDIV for peer's LTK (legacy pairing only)
+    pub peer_ediv: Option<Ediv>,
+    /// Rand for peer's LTK (legacy pairing only)
+    pub peer_rand: Option<Rand>,
+    /// Peer's CSRK (for verifying signed writes)
+    pub peer_csrk: Option<u128>,
 }
 
 impl BondInformation {
@@ -66,6 +93,10 @@ impl BondInformation {
             identity,
             is_bonded,
             security_level,
+            peer_ltk: None,
+            peer_ediv: None,
+            peer_rand: None,
+            peer_csrk: None,
         }
     }
 }
@@ -228,6 +259,19 @@ impl<const BOND_COUNT: usize> SecurityManager<BOND_COUNT> {
                 None
             }
         })
+    }
+
+    /// Find peer's LTK by EDIV and Rand (for legacy pairing re-encryption)
+    pub(crate) fn get_peer_ltk_by_ediv_rand(&self, ediv: Ediv, rand: Rand) -> Option<LongTermKey> {
+        trace!("[security manager] Find peer LTK by EDIV={} Rand={}", ediv.0, rand.0);
+        self.state
+            .borrow()
+            .bond
+            .iter()
+            .find_map(|bond| match (bond.peer_ediv, bond.peer_rand, bond.peer_ltk) {
+                (Some(e), Some(r), Some(ltk)) if e == ediv && r == rand => Some(ltk),
+                _ => None,
+            })
     }
 
     /// Has the random generator been seeded?
@@ -571,9 +615,16 @@ impl<const BOND_COUNT: usize> SecurityManager<BOND_COUNT> {
         match event.kind {
             LeEventKind::LeLongTermKeyRequest => {
                 let event_data = LeLongTermKeyRequest::from_hci_bytes_complete(event.data)?;
-                self.try_send_event(SecurityEventData::SendLongTermKey(event_data.handle))?;
+                self.try_send_event(SecurityEventData::SendLongTermKey {
+                    handle: event_data.handle,
+                    ediv: Ediv::new(event_data.encrypted_diversifier),
+                    rand: Rand::from_le_bytes(event_data.random_number),
+                })?;
             }
-            _ => (),
+            _ => {
+                info!("[security manager] Some other event");
+                ()
+            }
         }
         Ok(())
     }
@@ -768,6 +819,10 @@ impl<'sm, 'cm, 'cm2, 'cs, const B: usize, P: PacketPool> PairingOps<P> for Pairi
             identity: self.peer_identity,
             is_bonded,
             security_level,
+            peer_ltk: None,
+            peer_ediv: None,
+            peer_rand: None,
+            peer_csrk: None,
         };
         self.try_update_bond_information(&bond_info)?;
         self.security_manager
@@ -814,5 +869,29 @@ impl<'sm, 'cm, 'cm2, 'cs, const B: usize, P: PacketPool> PairingOps<P> for Pairi
             let _ = self.security_manager.events.try_send(SecurityEventData::TimerChange);
         }
         Ok(())
+    }
+
+    fn get_local_irk(&self) -> Option<IdentityResolvingKey> {
+        // TODO: Store and retrieve local IRK from SecurityManagerData
+        // For now, return None to indicate no local IRK is configured
+        None
+    }
+
+    fn try_add_device_to_resolving_list(
+        &self,
+        peer_addr_kind: crate::AddrKind,
+        peer_addr: crate::BdAddr,
+        peer_irk: [u8; 16],
+        local_irk: [u8; 16],
+    ) -> Result<(), Error> {
+        self.security_manager
+            .events
+            .try_send(SecurityEventData::AddDeviceToResolvingList {
+                peer_addr_kind,
+                peer_addr,
+                peer_irk,
+                local_irk,
+            })
+            .map_err(|_| Error::OutOfMemory)
     }
 }

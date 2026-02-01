@@ -675,13 +675,14 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
     where
         C: crate::ControllerCmdSync<bt_hci::cmd::le::LeLongTermKeyRequestReply>
             + crate::ControllerCmdAsync<bt_hci::cmd::le::LeEnableEncryption>
+            + crate::ControllerCmdSync<bt_hci::cmd::le::LeAddDeviceToResolvingList>
             + crate::ControllerCmdSync<bt_hci::cmd::link_control::Disconnect>,
     {
-        use bt_hci::cmd::le::{LeEnableEncryption, LeLongTermKeyRequestReply};
+        use bt_hci::cmd::le::{LeAddDeviceToResolvingList, LeEnableEncryption, LeLongTermKeyRequestReply};
         use bt_hci::cmd::link_control::Disconnect;
 
         match _event {
-            crate::security_manager::SecurityEventData::SendLongTermKey(handle) => {
+            crate::security_manager::SecurityEventData::SendLongTermKey { handle, ediv, rand } => {
                 let conn_info = self.state.borrow().connections.iter().find_map(|connection| {
                     match (connection.handle, connection.peer_identity) {
                         (Some(connection_handle), Some(identity)) => {
@@ -696,7 +697,17 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                 });
 
                 if let Some((conn, identity)) = conn_info {
-                    if let Some(ltk) = self.security_manager.get_peer_long_term_key(&identity) {
+                    // For LESC (EDIV=0, Rand=0), use identity-based lookup
+                    // For legacy (EDIV/Rand != 0), use EDIV/Rand-based lookup
+                    let ltk = if ediv.0 == 0 && rand.0 == 0 {
+                        // LESC pairing - lookup by identity
+                        self.security_manager.get_peer_long_term_key(&identity)
+                    } else {
+                        // Legacy pairing - lookup by EDIV/Rand
+                        self.security_manager.get_peer_ltk_by_ediv_rand(ediv, rand)
+                    };
+
+                    if let Some(ltk) = ltk {
                         let _ = host
                             .command(LeLongTermKeyRequestReply::new(handle, ltk.to_le_bytes()))
                             .await?;
@@ -741,6 +752,26 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                     }
                 } else {
                     warn!("[host] Enable encryption failed, unknown peer")
+                }
+            }
+            crate::security_manager::SecurityEventData::AddDeviceToResolvingList {
+                peer_addr_kind,
+                peer_addr,
+                peer_irk,
+                local_irk,
+            } => {
+                info!("[host] Adding device to resolving list: {:?}", peer_addr);
+                match host
+                    .command(LeAddDeviceToResolvingList::new(
+                        peer_addr_kind,
+                        peer_addr,
+                        peer_irk,
+                        local_irk,
+                    ))
+                    .await
+                {
+                    Ok(_) => info!("[host] Device added to resolving list"),
+                    Err(e) => warn!("[host] Failed to add device to resolving list"),
                 }
             }
             crate::security_manager::SecurityEventData::Timeout => {

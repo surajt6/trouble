@@ -744,16 +744,6 @@ impl<'reference, C: Controller, P: PacketPool, const MAX_SERVICES: usize> GattCl
         stack: &'reference Stack<'reference, C, P>,
         connection: &Connection<'reference, P>,
     ) -> Result<GattClient<'reference, C, P, MAX_SERVICES>, BleHostError<C::Error>> {
-        let l2cap = L2capHeader { channel: 4, length: 3 };
-        let mut buf = P::allocate().ok_or(Error::OutOfMemory)?;
-        let mut w = WriteCursor::new(buf.as_mut());
-        w.write_hci(&l2cap)?;
-        w.write(att::Att::Client(att::AttClient::Request(att::AttReq::ExchangeMtu {
-            mtu: P::MTU as u16 - 4,
-        })))?;
-
-        let len = w.len();
-        connection.send(Pdu::new(buf, len)).await;
         Ok(Self {
             known_services: RefCell::new(heapless::Vec::new()),
             stack,
@@ -763,6 +753,20 @@ impl<'reference, C: Controller, P: PacketPool, const MAX_SERVICES: usize> GattCl
 
             notifications: PubSubChannel::new(),
         })
+    }
+
+    /// Exchange Attribute MTU
+    pub async fn exchange_att_mtu(&self) -> Result<(), BleHostError<C::Error>> {
+        let request = att::AttReq::ExchangeMtu { mtu: P::MTU as u16 - 4 };
+        let response = self.request(request).await?;
+        let a: Result<Att<'_>, crate::codec::Error> = att::Att::decode(response.pdu.as_ref());
+
+        if let Ok(att::Att::Server(AttServer::Response(att::AttRsp::ExchangeMtu { mtu }))) = a {
+            self.connection.set_att_mtu(mtu);
+            trace!("Connection MTU set to: {:?}", mtu);
+        }
+
+        Ok(())
     }
 
     /// Discover primary services associated with a UUID.
